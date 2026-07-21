@@ -692,7 +692,7 @@ function generatePromoCode() {
   return chars.join("");
 }
 
-function applyPromoCode(rawCode, { promoCodes, redeemedPromoCodes, setRedeemedPromoCodes, incrementPromoCodeUses, onCpsBonus, onDiscount, showToast }) {
+async function applyPromoCode(rawCode, { promoCodes, clientId, redeemedPromoCodes, setRedeemedPromoCodes, incrementPromoCodeUses, onCpsBonus, onDiscount, showToast }) {
   // Comparaison exacte (sensible à la casse) : les codes peuvent mélanger
   // minuscules et majuscules (voir generatePromoCode), donc forcer la casse
   // ici romprait le rapprochement avec store.promoCodes.
@@ -702,6 +702,23 @@ function applyPromoCode(rawCode, { promoCodes, redeemedPromoCodes, setRedeemedPr
   if (!promo || !promo.active) { showToast("Code promo invalide"); return; }
   if (promo.maxUses != null && (promo.usesCount || 0) >= promo.maxUses) { showToast("Ce code promo a atteint sa limite d'utilisation"); return; }
   if (redeemedPromoCodes.has(code)) { showToast("Ce code promo a déjà été utilisé"); return; }
+  // Enregistre l'utilisation en base AVANT de créditer quoi que ce soit :
+  // la contrainte UNIQUE(promo_code_id, client_id) sur promo_code_redemptions
+  // (voir sql/007_promo_codes.sql) rejette toute seconde tentative pour ce
+  // même client, même depuis un autre appareil/session — bien plus fiable
+  // que l'ancien Set local, qui ne survivait pas à une reconnexion.
+  if (clientId) {
+    try {
+      await supabaseFetch(`promo_code_redemptions`, {
+        method: "POST",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify([{ promo_code_id: promo.id, client_id: clientId }]),
+      });
+    } catch (err) {
+      showToast("Ce code promo a déjà été utilisé");
+      return;
+    }
+  }
   setRedeemedPromoCodes(prev => new Set(prev).add(code));
   incrementPromoCodeUses(promo.id);
   if (promo.type === "cps_bonus") {
@@ -4232,10 +4249,22 @@ function SharedStoreProvider({ children }) {
   // Deux types : bonus de CPS offerts directement au client (cps_bonus),
   // ou remise en % sur le prochain rechargement (discount_topup, appliquée
   // côté TopUpSheet). usesCount suit l'usage réel (redeemPromoCode), maxUses
-  // = null → illimité.
-  const [promoCodes, setPromoCodes] = useState([
-    { id: "promo-1", code: "B1N-V9", type: "cps_bonus", value: 10, maxUses: null, usesCount: 3, active: true, createdAt: new Date(Date.now() - 10 * 86400000).toISOString(), expiresAt: null },
-  ]);
+  // = null → illimité. Les codes eux-mêmes sont créés depuis
+  // l'administration (ImoobilisAdmin.jsx, application détachée) — ce
+  // fichier se contente de les lire depuis Supabase et de suivre leur
+  // utilisation.
+  const [promoCodes, setPromoCodes] = useState([]);
+  useEffect(() => {
+    supabaseFetch(`promo_codes?select=id,code,type,value,max_uses,uses_count,active`)
+      .then(rows => {
+        if (!rows) return;
+        setPromoCodes(rows.map(r => ({
+          id: r.id, code: r.code, type: r.type, value: r.value,
+          maxUses: r.max_uses, usesCount: r.uses_count, active: r.active,
+        })));
+      })
+      .catch(err => console.error("Chargement Supabase (codes promo) échoué :", err));
+  }, []);
   function addPromoCode(promo) {
     setPromoCodes(prev => [{ id: `promo-${Date.now()}`, usesCount: 0, active: true, createdAt: new Date().toISOString(), ...promo }, ...prev]);
   }
@@ -4244,10 +4273,24 @@ function SharedStoreProvider({ children }) {
   }
   function deletePromoCode(id) { setPromoCodes(prev => prev.filter(p => p.id !== id)); }
   function incrementPromoCodeUses(id) {
-    setPromoCodes(prev => prev.map(p => p.id === id ? { ...p, usesCount: (p.usesCount || 0) + 1 } : p));
+    setPromoCodes(prev => {
+      const next = prev.map(p => p.id === id ? { ...p, usesCount: (p.usesCount || 0) + 1 } : p);
+      const promo = next.find(p => p.id === id);
+      if (promo) {
+        supabaseFetch(`promo_codes?id=eq.${id}`, {
+          method: "PATCH",
+          headers: { Prefer: "return=minimal" },
+          body: JSON.stringify({ uses_count: promo.usesCount }),
+        }).catch(err => console.error("Synchronisation Supabase (usage code promo) échouée :", err));
+      }
+      return next;
+    });
   }
-  // Codes déjà utilisés par le client (démo mono-client : un code ne peut
-  // être réclamé qu'une seule fois au total, pas par compte).
+  // Un code ne peut être réclamé qu'une seule fois par client — appliqué
+  // désormais via la contrainte réelle de la base (promo_code_redemptions,
+  // voir sql/007_promo_codes.sql) plutôt qu'un Set local qui ne survivait
+  // pas à une reconnexion. redeemedPromoCodes reste utilisé comme cache
+  // local pour un retour instantané dans l'interface.
   const [redeemedPromoCodes, setRedeemedPromoCodes] = useState(new Set());
 
   // ── Popups de notification (visite reçue / client contacté) ──
@@ -4371,6 +4414,7 @@ function SharedStoreProvider({ children }) {
       pendingClientView, setPendingClientView, pendingAdvertiserView, setPendingAdvertiserView,
       clientCpBalance, setClientCpBalance, clientCpBonus, setClientCpBonus,
       clientCpTransactions, setClientCpTransactions,
+      clientDbIdRef,
       pendingExplorationCP, setPendingExplorationCP,
       unlockedNearbyServices, setUnlockedNearbyServices,
       unlockedContacts, setUnlockedContacts,
@@ -7711,6 +7755,7 @@ function ImoobilisApp({ onLogout, extraProperties = [], demoAdvertiserPhone = nu
   function handleRedeemPromo(code) {
     applyPromoCode(code, {
       promoCodes: store.promoCodes,
+      clientId: store.clientDbIdRef.current,
       redeemedPromoCodes: store.redeemedPromoCodes,
       setRedeemedPromoCodes: store.setRedeemedPromoCodes,
       incrementPromoCodeUses: store.incrementPromoCodeUses,
