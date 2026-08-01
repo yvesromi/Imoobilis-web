@@ -4135,6 +4135,49 @@ function SharedStoreProvider({ children }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // ── Réception des codes promo partagés depuis l'administration ──
+  // ImoobilisAdmin.jsx (application détachée) écrit directement dans
+  // client_messages (voir handleSharePromo côté admin) : ce fichier n'a
+  // aucun moyen d'être notifié en direct (pas de websocket/Realtime
+  // configuré), donc on interroge Supabase toutes les 8 secondes tant que
+  // l'app est ouverte. Les messages "advertiser_contact" (créés localement
+  // par contactClient côté AdvertiserApp, dans cette même app) ne sont pas
+  // concernés — uniquement les codes promo, qui viennent de l'extérieur.
+  useEffect(() => {
+    let cancelled = false;
+    async function pollPromoMessages() {
+      if (!clientDbIdRef.current) return;
+      try {
+        const rows = await supabaseFetch(
+          `client_messages?client_id=eq.${clientDbIdRef.current}&type=eq.promo&select=id,is_read,created_at,promo_codes(code,type,value)&order=created_at.desc`
+        );
+        if (cancelled || !rows) return;
+        setAdvertiserMessages(prev => {
+          const existingIds = new Set(prev.map(m => m.id));
+          const fresh = rows
+            .filter(r => !existingIds.has(r.id) && r.promo_codes)
+            .map(r => ({
+              id: r.id,
+              type: "promo",
+              promoCode: r.promo_codes.code,
+              promoDescription: r.promo_codes.type === "cps_bonus"
+                ? `${r.promo_codes.value} CPS offerts`
+                : `${r.promo_codes.value}% de remise au prochain rechargement`,
+              time: new Date(r.created_at).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }),
+              read: r.is_read,
+            }));
+          return fresh.length ? [...fresh, ...prev] : prev;
+        });
+      } catch (err) {
+        console.error("Vérification Supabase (codes promo partagés) échouée :", err);
+      }
+    }
+    pollPromoMessages();
+    const id = setInterval(pollPromoMessages, 8000);
+    return () => { cancelled = true; clearInterval(id); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Solde : synchronisé à chaque changement (débit/crédit/remboursement).
   useEffect(() => {
     if (!clientDbIdRef.current) return;
@@ -4393,6 +4436,16 @@ function SharedStoreProvider({ children }) {
   function addAdvertiserMessage(msg) { setAdvertiserMessages(prev => [msg, ...prev]); }
   function markAdvertiserMessageRead(id) {
     setAdvertiserMessages(prev => prev.map(m => m.id === id ? { ...m, read: true } : m));
+    // Les messages "promo" viennent de Supabase (voir le sondage plus haut)
+    // et ont un vrai UUID ; les messages "advertiser_contact" sont créés
+    // localement (id du style "am-...") et n'existent pas en base.
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+      supabaseFetch(`client_messages?id=eq.${id}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({ is_read: true }),
+      }).catch(err => console.error("Synchronisation Supabase (message lu) échouée :", err));
+    }
   }
   function setVisitSchedule(advertiserPhone, schedule) {
     setVisitSchedules(prev => ({ ...prev, [advertiserPhone]: schedule }));
